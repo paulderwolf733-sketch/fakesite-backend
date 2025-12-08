@@ -1,13 +1,27 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from urllib.parse import urlparse
+import os
+import requests
 from typing import Literal
+from datetime import datetime
 
 app = FastAPI(
     title="FakeSite Detector Backend",
     version="0.1",
     description="Einfaches Heuristik-Backend für die Risikoanalyse von Webseiten."
 )
+
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Feedback")
+AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
+
+def get_airtable_url() -> str:
+    if not AIRTABLE_BASE_ID:
+        raise RuntimeError("AIRTABLE_BASE_ID ist nicht gesetzt")
+    if not AIRTABLE_TABLE_NAME:
+        raise RuntimeError("AIRTABLE_TABLE_NAME ist nicht gesetzt")
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
 
 # ---- Datenmodelle ----
 
@@ -162,24 +176,39 @@ def analyze(page: PageData):
 @app.post("/feedback")
 def receive_feedback(fb: Feedback):
     """
-    Nimmt Feedback aus der Extension entgegen und schreibt es in eine Log-Datei.
-    Später kann man damit ein ML-Modell trainieren oder Regeln verbessern.
+    Nimmt Feedback aus der Extension entgegen und speichert es in Airtable.
     """
-    import json
-    from datetime import datetime
+    if not AIRTABLE_TOKEN:
+        raise RuntimeError("AIRTABLE_TOKEN ist nicht gesetzt")
 
-    record = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "url": fb.url,
-        "backend_score": fb.backend_score,
-        "backend_level": fb.backend_level,
-        "backend_reasons": fb.backend_reasons,
-        "user_label": fb.user_label,
+    airtable_url = get_airtable_url()
+
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+        "Content-Type": "application/json",
     }
 
-    # Sehr simples Logging in eine JSONL-Datei
-    with open("feedback_log.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Backend-Reasons in einen String packen
+    reasons_text = "\n".join(fb.backend_reasons or [])
+
+    payload = {
+        "records": [
+            {
+                "fields": {
+                    "URL": fb.url,
+                    "Backend Score": fb.backend_score,
+                    "Backend Level": fb.backend_level,
+                    "Backend Reasons": reasons_text,
+                    "User Label": fb.user_label,
+                    "Timestamp": datetime.utcnow().isoformat(),
+                }
+            }
+        ]
+    }
+
+    resp = requests.post(airtable_url, headers=headers, json=payload, timeout=10)
+    if not resp.ok:
+        # Zum Debuggen kannst du dir das Response-JSON auch in den Logs anschauen
+        raise RuntimeError(f"Airtable-Fehler: {resp.status_code} {resp.text}")
 
     return {"status": "ok"}
-
