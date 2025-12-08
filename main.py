@@ -200,7 +200,6 @@ def receive_feedback(fb: Feedback):
                     "Backend Level": fb.backend_level,
                     "Backend Reasons": reasons_text,
                     "User Label": fb.user_label,
-                    "Timestamp": datetime.utcnow().isoformat(),
                 }
             }
         ]
@@ -212,3 +211,4 @@ def receive_feedback(fb: Feedback):
         raise RuntimeError(f"Airtable-Fehler: {resp.status_code} {resp.text}")
 
     return {"status": "ok"}
+
