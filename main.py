@@ -29,7 +29,7 @@ LLM_SYSTEM_PROMPT = """
 Du bist ein automatischer Klassifikator für potenziell betrügerische Webseiten.
 
 Du bekommst einen AUSZUG aus dem Text einer Website (max. einige tausend Zeichen).
-Deine Aufgabe ist, NUR anhand dieses Textes eine Risikoeinschätzung vorzunehmen.
+Deine Aufgabe ist, NUR anhand dieses Textes eine Risikoeinschätzung vorzunehmen UND typische Frames/Deutungsrahmen zu identifizieren.
 
 Ziele:
 - Erkenne, ob der Text harmlos, verdächtig oder sehr wahrscheinlich Betrug ist.
@@ -39,6 +39,9 @@ Ziele:
   - Drohungen (z.B. Konto wird gesperrt)
   - Appell an Gier („schnell reich werden“, unrealistische Gewinne)
   - Forderung nach Geld, Zugangsdaten, persönlichen Daten oder Krypto-Transaktionen.
+- Erkenne FRAMES: zentrale Begriffe oder Phrasen, die einen bestimmten Deutungsrahmen setzen
+  (z.B. „Steuergeschenk“ → Frame: Staat verschenkt Geld an bestimmte Gruppen;
+   „Flüchtlingswelle“ → Frame: Naturkatastrophe, Kontrollverlust).
 
 Deine Ausgabe MUSS ein gültiges JSON-Objekt sein, OHNE zusätzlichen Text, OHNE Erklärungen, OHNE Markdown.
 
@@ -65,12 +68,21 @@ Das JSON MUSS GENAU dieses Schema haben:
       "confidence": float (0.0 bis 1.0),
       "explanation": string (kurze Begründung auf Deutsch)
     }
+  ],
+  "frames": [
+    {
+      "trigger": string,                // Wort oder kurze Phrase, die GENAU so im Text vorkommt
+      "frame_label": string,            // kurzer Name des Frames (z.B. „Staat verschenkt Geld“)
+      "explanation": string             // 1–2 Sätze, was der Frame bewirken soll
+    }
   ]
 }
 
 Hinweise:
+- Nenne maximal 10 Frames, wähle die wichtigsten.
+- Der Wert "trigger" MUSS eine exakte Wort- oder Phrase sein, die im übergebenen Text vorkommt
+  (damit sie später im UI markiert werden kann).
 - Wenn du KEIN klares Risiko-Ergebnis hast, verwende "safe" oder "suspicious" mit passender Confidence.
-- Wenn der Text gemischt ist, bewerte die Dominanz: Wenn Scam-Elemente überwiegen, nutze "scam".
 - overall_confidence beschreibt deine Sicherheit in der GESAMT-Klassifikation.
 """
 
@@ -86,18 +98,32 @@ def truncate_text(text: str, max_chars: int = 4000) -> str:
 
 def analyze_with_llm(page_text: str) -> dict | None:
     """
-    Ruft gpt-4.1-mini auf, um den Text zu klassifizieren.
-    Gibt ein Dict mit den Feldern aus dem Schema zurück oder None bei Fehler.
+    Ruft ein OpenAI-LLM (z.B. gpt-4.1-mini) auf, um den Webseiten-Text
+    zu analysieren und ein strukturiertes JSON mit Risiko, Tone, Frames usw.
+    zurückzugeben.
+
+    Rückgabe:
+      - dict mit Feldern (overall_label, overall_confidence, page_type, tone, asks_for, risk_reasons, frames)
+      - oder None, wenn kein API-Key gesetzt ist oder ein Fehler auftritt.
     """
     if not client or not OPENAI_API_KEY:
-        # Kein API-Key -> LLM wird einfach übersprungen
+        # Kein API-Key konfiguriert -> LLM-Analyse wird übersprungen
         return None
 
-    snippet = truncate_text(page_text, max_chars=4000)
-    if not snippet:
+    # ---------------- Text aufbereiten & kürzen ----------------
+    if not page_text:
         return None
 
-    try:
+    # Whitespace normalisieren
+    normalized = re.sub(r"\s+", " ", page_text).strip()
+    if not normalized:
+        return None
+
+    # Max. Länge begrenzen (Kosten & Latenz im Griff behalten)
+    max_chars = 4000
+    snippet = normalized[:max_chars]
+
+   try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
@@ -115,7 +141,7 @@ def analyze_with_llm(page_text: str) -> dict | None:
 
         raw_content = completion.choices[0].message.content or ""
 
-        # Versuche JSON sicher zu extrahieren (falls das Modell doch mal irgendwas drumherum schreibt)
+        # Versuche sicher das JSON aus der Antwort zu extrahieren
         start = raw_content.find("{")
         end = raw_content.rfind("}")
         if start != -1 and end != -1:
@@ -125,10 +151,12 @@ def analyze_with_llm(page_text: str) -> dict | None:
 
         data = json.loads(raw_json)
         return data
+
     except Exception as e:
-        # Zum Debuggen in den Logs ansehen, aber die Analyse nicht komplett abbrechen
+        # Im Fehlerfall Backend nicht komplett zerschießen, nur LLM-Teil überspringen
         print("LLM-Analysefehler:", repr(e))
         return None
+
 
 def get_airtable_url() -> str:
     if not AIRTABLE_BASE_ID:
@@ -146,17 +174,25 @@ class PageData(BaseModel):
     hasCreditCard: bool = False
 
 
-from typing import Optional, Literal
+from typing import Optional, Literal, List
+
+class FrameInfo(BaseModel):
+    trigger: str
+    frame_label: str
+    explanation: str
 
 class RiskResult(BaseModel):
     score: int
     level: Literal["green", "yellow", "red"]
-    reasons: list[str]
+    reasons: List[str]
 
-    # optionale Zusatzinfos aus der LLM-Analyse
+    # optional: Metadaten aus der LLM-Analyse
     llm_label: Optional[str] = None
     llm_confidence: Optional[float] = None
     llm_page_type: Optional[str] = None
+
+    # neue Frames
+    frames: Optional[List[FrameInfo]] = None
 
 
 class Feedback(BaseModel):
@@ -381,5 +417,6 @@ def receive_feedback(fb: Feedback):
         raise RuntimeError(f"Airtable-Fehler: {resp.status_code} {resp.text}")
 
     return {"status": "ok"}
+
 
 
