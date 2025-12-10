@@ -1,19 +1,39 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from urllib.parse import urlparse
+
 import os
 import requests
 import json
 import re
-from typing import Literal
 from datetime import datetime
+from typing import Optional, Literal, List
+
 from openai import OpenAI  # neues OpenAI SDK
+
+# ------------------------------------------------------------------------------
+# FastAPI App
+# ------------------------------------------------------------------------------
 
 app = FastAPI(
     title="FakeSite Detector Backend",
     version="0.1",
     description="Einfaches Heuristik-Backend für die Risikoanalyse von Webseiten."
 )
+
+# CORS erlauben (wichtig für Browser/Extension)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # für MVP ok; später evtl. einschränken
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------------------------------------------------------
+# Konfiguration: Airtable & OpenAI
+# ------------------------------------------------------------------------------
 
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Feedback")
@@ -22,7 +42,6 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# OpenAI-Client nur initialisieren, wenn ein API-Key gesetzt ist
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 LLM_SYSTEM_PROMPT = """
@@ -71,9 +90,9 @@ Das JSON MUSS GENAU dieses Schema haben:
   ],
   "frames": [
     {
-      "trigger": string,                // Wort oder kurze Phrase, die GENAU so im Text vorkommt
-      "frame_label": string,            // kurzer Name des Frames (z.B. „Staat verschenkt Geld“)
-      "explanation": string             // 1–2 Sätze, was der Frame bewirken soll
+      "trigger": string,
+      "frame_label": string,
+      "explanation": string
     }
   ]
 }
@@ -86,15 +105,19 @@ Hinweise:
 - overall_confidence beschreibt deine Sicherheit in der GESAMT-Klassifikation.
 """
 
+# ------------------------------------------------------------------------------
+# Hilfsfunktionen
+# ------------------------------------------------------------------------------
+
 def truncate_text(text: str, max_chars: int = 4000) -> str:
     """Whitespace normalisieren und Text auf max_chars kürzen."""
     if not text:
         return ""
-    # Mehrfache Leerzeichen/Zeilenumbrüche zusammenschrumpfen
     normalized = re.sub(r"\s+", " ", text).strip()
     if len(normalized) <= max_chars:
         return normalized
     return normalized[:max_chars]
+
 
 def analyze_with_llm(page_text: str) -> dict | None:
     """
@@ -103,27 +126,21 @@ def analyze_with_llm(page_text: str) -> dict | None:
     zurückzugeben.
 
     Rückgabe:
-      - dict mit Feldern (overall_label, overall_confidence, page_type, tone, asks_for, risk_reasons, frames)
+      - dict mit Feldern (overall_label, overall_confidence, page_type, tone,
+        asks_for, risk_reasons, frames)
       - oder None, wenn kein API-Key gesetzt ist oder ein Fehler auftritt.
     """
     if not client or not OPENAI_API_KEY:
-        # Kein API-Key konfiguriert -> LLM-Analyse wird übersprungen
         return None
 
-    # ---------------- Text aufbereiten & kürzen ----------------
     if not page_text:
         return None
 
-    # Whitespace normalisieren
-    normalized = re.sub(r"\s+", " ", page_text).strip()
-    if not normalized:
+    snippet = truncate_text(page_text, max_chars=4000)
+    if not snippet:
         return None
 
-    # Max. Länge begrenzen (Kosten & Latenz im Griff behalten)
-    max_chars = 4000
-    snippet = normalized[:max_chars]
-
-   try:
+    try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
@@ -153,7 +170,6 @@ def analyze_with_llm(page_text: str) -> dict | None:
         return data
 
     except Exception as e:
-        # Im Fehlerfall Backend nicht komplett zerschießen, nur LLM-Teil überspringen
         print("LLM-Analysefehler:", repr(e))
         return None
 
@@ -165,7 +181,9 @@ def get_airtable_url() -> str:
         raise RuntimeError("AIRTABLE_TABLE_NAME ist nicht gesetzt")
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
 
-# ---- Datenmodelle ----
+# ------------------------------------------------------------------------------
+# Datenmodelle
+# ------------------------------------------------------------------------------
 
 class PageData(BaseModel):
     url: str
@@ -174,24 +192,21 @@ class PageData(BaseModel):
     hasCreditCard: bool = False
 
 
-from typing import Optional, Literal, List
-
 class FrameInfo(BaseModel):
     trigger: str
     frame_label: str
     explanation: str
+
 
 class RiskResult(BaseModel):
     score: int
     level: Literal["green", "yellow", "red"]
     reasons: List[str]
 
-    # optional: Metadaten aus der LLM-Analyse
     llm_label: Optional[str] = None
     llm_confidence: Optional[float] = None
     llm_page_type: Optional[str] = None
 
-    # neue Frames
     frames: Optional[List[FrameInfo]] = None
 
 
@@ -199,40 +214,37 @@ class Feedback(BaseModel):
     url: str
     backend_score: int
     backend_level: str
-    backend_reasons: list[str]
+    backend_reasons: List[str]
     user_label: Literal["ok", "scam", "false_positive"]
-    
 
-# ---- Analysefunktion ----
+# ------------------------------------------------------------------------------
+# Analysefunktion
+# ------------------------------------------------------------------------------
 
 def analyze_page(data: PageData) -> RiskResult:
     # --------- 1) Heuristik wie bisher ---------
     url_score = 0
     content_score = 0
     form_score = 0
-    reasons: list[str] = []
+    reasons: List[str] = []
 
     # --- URL / Domain-Analyse ---
     parsed = urlparse(data.url)
     hostname = parsed.hostname or ""
 
-    # 1) Ungewöhnliche Länge
     if len(hostname) > 25 or len(hostname) < 5:
         url_score += 10
         reasons.append("Ungewöhnlich lange oder sehr kurze Domain.")
 
-    # 2) Auffällige TLDs
     risky_tlds = [".top", ".shop", ".xyz", ".online", ".club"]
     if any(hostname.endswith(tld) for tld in risky_tlds):
         url_score += 10
         reasons.append("Top-Level-Domain ist häufiger bei Fake-Shops anzutreffen.")
 
-    # 3) Viele Zahlen / Bindestriche in der Domain
     if re.search(r"[0-9-]{5,}", hostname):
         url_score += 10
         reasons.append("Viele Zahlen oder Bindestriche in der Domain.")
 
-    # 4) Keine HTTPS-Verbindung
     if not data.url.startswith("https://"):
         url_score += 25
         reasons.append("Seite nutzt kein HTTPS (unsichere Verbindung).")
@@ -240,7 +252,6 @@ def analyze_page(data: PageData) -> RiskResult:
     # --- Inhaltsanalyse (Text) ---
     text_lower = (data.text or "").lower()
 
-    # Aggressive Sales-Phrasen
     sales_patterns = [
         "nur heute", "limited offer", "jetzt zugreifen",
         "90% rabatt", "80% rabatt", "70% rabatt",
@@ -251,7 +262,6 @@ def analyze_page(data: PageData) -> RiskResult:
         content_score += 20
         reasons.append("Aggressive Verkaufs- oder Druckformulierungen gefunden.")
 
-    # Phishing-Phrasen
     phishing_patterns = [
         "ihr konto wird gesperrt",
         "bestätigen sie ihre zugangsdaten",
@@ -263,7 +273,6 @@ def analyze_page(data: PageData) -> RiskResult:
         content_score += 30
         reasons.append("Typische Phishing-Formulierungen erkannt.")
 
-    # Zahlungsdruck / riskante Zahlungsarten
     payment_patterns = [
         "nur vorkasse", "vorkasse", "sofortüberweisung",
         "zahlen sie jetzt", "sofort bezahlen",
@@ -273,13 +282,11 @@ def analyze_page(data: PageData) -> RiskResult:
         content_score += 15
         reasons.append("Starker Druck zur sofortigen Zahlung bzw. riskante Zahlungsarten.")
 
-    # Grobe „Qualitäts“-Heuristik
     words = [w for w in (data.text or "").split() if len(w) > 10]
     if len(words) > 80:
         content_score += 10
         reasons.append("Viele ungewöhnlich lange Wörter – mögliche Übersetzungs-/Qualitätsprobleme.")
 
-    # --- Formular-Flags ---
     if data.hasPassword:
         form_score += 10
         reasons.append("Seite fragt nach einem Passwort.")
@@ -291,9 +298,10 @@ def analyze_page(data: PageData) -> RiskResult:
 
     # --------- 2) LLM-Analyse des Textes ---------
     llm_result = analyze_with_llm(data.text or "")
-    llm_label = None
-    llm_confidence = None
-    llm_page_type = None
+    llm_label: Optional[str] = None
+    llm_confidence: Optional[float] = None
+    llm_page_type: Optional[str] = None
+    frames: Optional[List[FrameInfo]] = None
 
     llm_extra_score = 0
 
@@ -302,23 +310,17 @@ def analyze_page(data: PageData) -> RiskResult:
         llm_confidence = float(llm_result.get("overall_confidence", 0.0))
         llm_page_type = llm_result.get("page_type")
 
-        # Score-Beitrag des LLM
-        # Du kannst das Gewicht später feinjustieren.
         if llm_label == "scam":
-            # starke Warnung
-            llm_extra_score += int(40 + 40 * llm_confidence)  # 40–80 Punkte
+            llm_extra_score += int(40 + 40 * llm_confidence)
         elif llm_label == "suspicious":
-            llm_extra_score += int(20 + 30 * llm_confidence)  # 20–50 Punkte
+            llm_extra_score += int(20 + 30 * llm_confidence)
         elif llm_label == "safe":
-            # wir machen es nicht "negativ", sondern lassen base_score bestehen
             llm_extra_score += 0
 
-        # LLM-Einschätzung als Begründung hinzufügen
         reasons.append(
             f"LLM-Einschätzung: {llm_label.upper()} (Confidence {llm_confidence:.2f})."
         )
 
-        # Einzelne Risk-Faktoren ausgeben
         risk_reasons = llm_result.get("risk_reasons") or []
         for rr in risk_reasons:
             factor = rr.get("factor", "other")
@@ -327,18 +329,33 @@ def analyze_page(data: PageData) -> RiskResult:
             if expl:
                 reasons.append(f"LLM-Risiko ({factor}, {conf:.2f}): {expl}")
 
+        # Frames übernehmen
+        raw_frames = llm_result.get("frames") or []
+        f_list: List[FrameInfo] = []
+        for f in raw_frames:
+            trigger = (f.get("trigger") or "").strip()
+            frame_label = (f.get("frame_label") or "").strip()
+            explanation = (f.get("explanation") or "").strip()
+            if trigger and frame_label and explanation:
+                f_list.append(FrameInfo(
+                    trigger=trigger,
+                    frame_label=frame_label,
+                    explanation=explanation
+                ))
+        if f_list:
+            frames = f_list
+            reasons.append(
+                "LLM-Frames erkannt: " + ", ".join(sorted({fr.frame_label for fr in frames}))
+            )
+
     # --------- 3) Gesamtscore & Level ---------
     total_score = base_score + llm_extra_score
-    if total_score < 0:
-        total_score = 0
-    if total_score > 100:
-        total_score = 100
+    total_score = max(0, min(100, total_score))
 
     if total_score <= 25:
         level = "green"
     elif total_score <= 55:
         level = "yellow"
-        # optional: minimaler Score, wenn LLM "scam" sagt, aber Basiswert niedrig ist
         if llm_label == "scam" and total_score < 40:
             total_score = 40
     else:
@@ -351,14 +368,15 @@ def analyze_page(data: PageData) -> RiskResult:
         score=total_score,
         level=level,
         reasons=reasons,
-        # Die folgenden Felder kannst du in Airtable oder späterem ML nutzen
         llm_label=llm_label,
         llm_confidence=llm_confidence,
         llm_page_type=llm_page_type,
+        frames=frames,
     )
 
-
-# ---- API-Endpunkte ----
+# ------------------------------------------------------------------------------
+# API-Endpunkte
+# ------------------------------------------------------------------------------
 
 @app.get("/")
 def root():
@@ -371,12 +389,7 @@ def root():
 
 @app.post("/analyze", response_model=RiskResult)
 def analyze(page: PageData):
-    """
-    Nimmt URL, Textauszug und einfache Flags entgegen und liefert
-    einen Risiko-Score (0–100), Level (green/yellow/red) und Begründungen zurück.
-    """
-    result = analyze_page(page)
-    return result
+    return analyze_page(page)
 
 
 @app.post("/feedback")
@@ -394,7 +407,6 @@ def receive_feedback(fb: Feedback):
         "Content-Type": "application/json",
     }
 
-    # Backend-Reasons in einen String packen
     reasons_text = "\n".join(fb.backend_reasons or [])
 
     payload = {
@@ -413,10 +425,6 @@ def receive_feedback(fb: Feedback):
 
     resp = requests.post(airtable_url, headers=headers, json=payload, timeout=10)
     if not resp.ok:
-        # Zum Debuggen kannst du dir das Response-JSON auch in den Logs anschauen
         raise RuntimeError(f"Airtable-Fehler: {resp.status_code} {resp.text}")
 
     return {"status": "ok"}
-
-
-
