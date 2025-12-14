@@ -18,8 +18,8 @@ from openai import OpenAI
 
 app = FastAPI(
     title="FakeSite Detector Backend",
-    version="0.3",
-    description="Heuristik + optional LLM (Chunking), mit zentralem Airtable-Cache pro URL."
+    version="0.4",
+    description="Heuristik + optional LLM (3-Chunks, Kontext pro Chunk), mit zentralem Airtable-Cache pro URL."
 )
 
 app.add_middleware(
@@ -44,17 +44,27 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ------------------------------------------------------------------------------
-# LLM Prompt (mit Evidence Snippets)
+# LLM Prompt (robuste Frames + Evidence Snippets + Trigger-Constraints)
 # ------------------------------------------------------------------------------
 
 LLM_SYSTEM_PROMPT = """
 Du bist ein automatischer Klassifikator für potenziell betrügerische Webseiten.
 
-Du bekommst einen TEXTAUSZUG (Chunk) einer Website.
+Du bekommst einen TEXT-CHUNK einer Website, plus Kontext (URL/Titel/Meta/Überschriften).
 WICHTIG:
 - Der Text kann journalistisch/informativ sein. Wenn er wie ein normaler Artikel/Info-Text wirkt,
-  bewerte ihn eher als "safe" und page_type="info" (sofern keine Scam-Signale vorliegen).
-- Erfinde nichts. Wenn du etwas als Risiko nennst, liefere kurze "evidence_snippets" aus dem Text.
+  bewerte ihn eher als "safe" und page_type="info", sofern keine Scam-Signale vorliegen.
+- Erfinde nichts. Nenne nur Risiken/Frames, die du im gegebenen Text tatsächlich findest.
+
+EVIDENCE-REGELN (sehr wichtig):
+- Für jede Risikobehauptung oder jeden Frame musst du kurze Belegstellen liefern.
+- "evidence_snippets" enthält kurze Textausschnitte aus dem Chunk (keine langen Zitate).
+
+FRAME-REGELN (sehr wichtig):
+- frames[].trigger MUSS ein exakter Substring aus dem CHUNK-TEXT sein (copy/paste).
+- trigger max. 8 Wörter, keine Umformulierung.
+- Jeder trigger muss in mindestens einem evidence_snippets[].snippet vorkommen.
+- Wenn du keine guten, exakten Trigger findest: lieber weniger Frames ausgeben.
 
 Ziele:
 - Erkenne, ob der Text harmlos, verdächtig oder sehr wahrscheinlich Betrug ist.
@@ -84,9 +94,10 @@ Schema:
   "frames": [ { "trigger": string, "frame_label": string, "explanation": string } ]
 }
 
-Regeln:
-- evidence_snippets: max. 6 Einträge, zitiere kurze Textstellen (keine langen Zitate).
-- risk_reasons/frames müssen zur Evidence passen (keine Fantasie).
+Limits:
+- evidence_snippets: max. 6 Einträge.
+- risk_reasons: max. 8 Einträge.
+- frames: max. 8 Einträge.
 """
 
 # ------------------------------------------------------------------------------
@@ -317,7 +328,7 @@ def airtable_update_summary_feedback(url_key: str, user_label: str) -> None:
         print("Airtable summary feedback patch error:", resp.status_code, resp.text)
 
 # ------------------------------------------------------------------------------
-# LLM / Text (Chunking + Aggregation)
+# LLM / Text (3-Chunks + Kontext pro Chunk + Aggregation)
 # ------------------------------------------------------------------------------
 
 def normalize_text(text: str) -> str:
@@ -325,15 +336,45 @@ def normalize_text(text: str) -> str:
         return ""
     return re.sub(r"\s+", " ", text).strip()
 
-def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 250, max_chunks: int = 4) -> List[str]:
+def split_context_and_main(text: str) -> Tuple[str, str]:
     """
-    Split normalized text into overlapping chunks to avoid missing important parts.
+    Erwartet Content-Script-Format ungefähr:
+    URL: ...
+    TITLE: ...
+    ...
+    ----
+    MAIN TEXT:
+    ...
+
+    Falls Marker fehlen, wird leerer Kontext und gesamter Text als main zurückgegeben.
+    """
+    if not text:
+        return "", ""
+
+    # robust: finde MAIN TEXT:
+    m = re.search(r"\bMAIN TEXT:\s*", text)
+    if not m:
+        # fallback: finde ----
+        sep = text.find("----")
+        if sep != -1:
+            ctx = text[:sep].strip()
+            main = text[sep + 4:].strip()
+            return ctx, main
+        return "", text.strip()
+
+    ctx = text[: m.start()].strip()
+    main = text[m.end():].strip()
+    return ctx, main
+
+def chunk_text(text: str, chunk_size: int, overlap: int = 500, max_chunks: int = 3) -> List[str]:
+    """
+    Split normalized main text into overlapping chunks.
     """
     t = normalize_text(text)
     if not t:
         return []
 
-    chunks = []
+    chunks: List[str] = []
     start = 0
     n = len(t)
 
@@ -360,11 +401,41 @@ def _label_rank(label: str) -> int:
 def _dedup_key(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-def analyze_with_llm_chunk(snippet: str) -> Optional[dict]:
+def _trigger_word_count_ok(trigger: str, max_words: int = 8) -> bool:
+    return 1 <= len((trigger or "").strip().split()) <= max_words
+
+def _enforce_trigger_in_evidence(frames: List[dict], evidence: List[dict]) -> List[dict]:
+    """
+    Keep only frames whose trigger appears in at least one evidence snippet AND trigger is short enough.
+    """
+    ev_text = " ".join([(e.get("snippet") or "") for e in (evidence or [])]).lower()
+    out = []
+    for fr in frames or []:
+        if not isinstance(fr, dict):
+            continue
+        trig = (fr.get("trigger") or "").strip()
+        if not trig:
+            continue
+        if not _trigger_word_count_ok(trig, max_words=8):
+            continue
+        if trig.lower() not in ev_text:
+            continue
+        out.append(fr)
+    return out
+
+def analyze_with_llm_chunk(context_prefix: str, chunk: str) -> Optional[dict]:
     if not client or not OPENAI_API_KEY:
         return None
-    if not snippet:
+    if not chunk:
         return None
+
+    # request text to model
+    user_text = (
+        "KONTEXT (kann helfen, muss aber nicht vollständig sein):\n"
+        f"{context_prefix}\n\n"
+        "CHUNK-TEXT (nur hieraus dürfen Trigger/Evidence zitiert werden!):\n"
+        f"{chunk}"
+    )
 
     try:
         completion = client.chat.completions.create(
@@ -372,7 +443,7 @@ def analyze_with_llm_chunk(snippet: str) -> Optional[dict]:
             temperature=0.2,
             messages=[
                 {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                {"role": "user", "content": "Hier ist der Textauszug (Chunk) der Website:\n\n" + snippet},
+                {"role": "user", "content": user_text},
             ],
         )
         raw_content = completion.choices[0].message.content or ""
@@ -381,7 +452,21 @@ def analyze_with_llm_chunk(snippet: str) -> Optional[dict]:
         end = raw_content.rfind("}")
         raw_json = raw_content[start:end + 1] if start != -1 and end != -1 else raw_content
 
-        return json.loads(raw_json)
+        parsed = json.loads(raw_json)
+
+        # Hardening: filter frames to match evidence + wordcount
+        ev = parsed.get("evidence_snippets") or []
+        fr = parsed.get("frames") or []
+        if isinstance(fr, list) and isinstance(ev, list):
+            parsed["frames"] = _enforce_trigger_in_evidence(fr, ev)[:8]
+
+        # clamp some fields
+        lab = str(parsed.get("overall_label", "safe")).lower().strip()
+        if lab not in ("safe", "suspicious", "scam"):
+            parsed["overall_label"] = "safe"
+        parsed["overall_confidence"] = float(max(0.0, min(1.0, _safe_float(parsed.get("overall_confidence", 0.0)))))
+
+        return parsed
     except Exception as e:
         print("LLM-Chunk-Analysefehler:", repr(e))
         return None
@@ -390,30 +475,28 @@ def aggregate_llm_results(results: List[dict]) -> Optional[dict]:
     if not results:
         return None
 
-    # Filter valide Dicts
     items = [r for r in results if isinstance(r, dict)]
     if not items:
         return None
 
-    # 1) Overall label: worst-case by rank, tie-break by confidence
+    # Worst-case label by rank; tie-break by confidence
     best = None
     for r in items:
         lab = str(r.get("overall_label", "safe")).lower()
         conf = _safe_float(r.get("overall_confidence", 0.0))
-        cand = ( _label_rank(lab), conf, r )
+        cand = (_label_rank(lab), conf, r)
         if best is None:
             best = cand
         else:
-            # higher rank = worse; if equal rank -> higher confidence
             if cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
                 best = cand
 
     worst_rank, worst_conf, worst_r = best if best else (0, 0.0, items[0])
 
-    # 2) page_type: prefer from worst result if present, else most common
+    # page_type: prefer from worst result if present, else most common
     page_type = (worst_r.get("page_type") or "").strip() or None
     if not page_type:
-        counts = {}
+        counts: Dict[str, int] = {}
         for r in items:
             pt = (r.get("page_type") or "").strip()
             if pt:
@@ -421,7 +504,7 @@ def aggregate_llm_results(results: List[dict]) -> Optional[dict]:
         if counts:
             page_type = sorted(counts.items(), key=lambda x: x[1], reverse=True)[0][0]
 
-    # 3) tone: take max per dimension
+    # tone: max per dimension
     tone = {"urgency": 0.0, "threat": 0.0, "greed_appeal": 0.0}
     for r in items:
         t = r.get("tone") or {}
@@ -429,15 +512,15 @@ def aggregate_llm_results(results: List[dict]) -> Optional[dict]:
         tone["threat"] = max(tone["threat"], _safe_float(t.get("threat", 0.0)))
         tone["greed_appeal"] = max(tone["greed_appeal"], _safe_float(t.get("greed_appeal", 0.0)))
 
-    # 4) asks_for: OR
+    # asks_for: OR
     asks_for = {"money": False, "credentials": False, "personal_data": False, "crypto_transfer": False}
     for r in items:
         a = r.get("asks_for") or {}
         for k in asks_for.keys():
             asks_for[k] = asks_for[k] or bool(a.get(k, False))
 
-    # 5) risk_reasons: merge + dedup (limit)
-    merged_rr = []
+    # risk_reasons: merge + dedup
+    merged_rr: List[dict] = []
     seen_rr = set()
     for r in items:
         for rr in (r.get("risk_reasons") or []):
@@ -453,33 +536,11 @@ def aggregate_llm_results(results: List[dict]) -> Optional[dict]:
                 continue
             seen_rr.add(key)
             merged_rr.append({"factor": factor, "confidence": conf, "explanation": expl})
-
-    # sort by confidence desc, keep top 10
     merged_rr.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
-    merged_rr = merged_rr[:10]
+    merged_rr = merged_rr[:8]
 
-    # 6) frames: merge + dedup (limit)
-    merged_frames = []
-    seen_fr = set()
-    for r in items:
-        for fr in (r.get("frames") or []):
-            if not isinstance(fr, dict):
-                continue
-            trig = (fr.get("trigger") or "").strip()
-            fl = (fr.get("frame_label") or "").strip()
-            ex = (fr.get("explanation") or "").strip()
-            if not trig or not fl or not ex:
-                continue
-            key = _dedup_key(f"{trig}::{fl}")
-            if key in seen_fr:
-                continue
-            seen_fr.add(key)
-            merged_frames.append({"trigger": trig, "frame_label": fl, "explanation": ex})
-
-    merged_frames = merged_frames[:10]
-
-    # 7) evidence_snippets: merge (limit), prefer from worst result first
-    merged_ev = []
+    # evidence_snippets: merge + dedup (prefer worst first)
+    merged_ev: List[dict] = []
     seen_ev = set()
 
     def add_evidence_from(r: dict):
@@ -499,20 +560,41 @@ def aggregate_llm_results(results: List[dict]) -> Optional[dict]:
             if len(merged_ev) >= 10:
                 return
 
-    # Worst first, then rest
     add_evidence_from(worst_r)
     for r in items:
-        if r is worst_r:
+        if r is worst_r or len(merged_ev) >= 10:
             continue
-        if len(merged_ev) >= 10:
-            break
         add_evidence_from(r)
+
+    # frames: merge + dedup, but enforce trigger-in-evidence globally
+    merged_frames: List[dict] = []
+    seen_fr = set()
+    for r in items:
+        for fr in (r.get("frames") or []):
+            if not isinstance(fr, dict):
+                continue
+            trig = (fr.get("trigger") or "").strip()
+            fl = (fr.get("frame_label") or "").strip()
+            ex = (fr.get("explanation") or "").strip()
+            if not trig or not fl or not ex:
+                continue
+            if not _trigger_word_count_ok(trig, max_words=8):
+                continue
+            key = _dedup_key(f"{trig}::{fl}")
+            if key in seen_fr:
+                continue
+            seen_fr.add(key)
+            merged_frames.append({"trigger": trig, "frame_label": fl, "explanation": ex})
+
+    # final enforce: trigger must appear in merged evidence
+    merged_frames = _enforce_trigger_in_evidence(merged_frames, merged_ev)[:10]
+    merged_frames = merged_frames[:8]
 
     agg = {
         "overall_label": "scam" if worst_rank == 2 else ("suspicious" if worst_rank == 1 else "safe"),
         "overall_confidence": float(max(0.0, min(1.0, worst_conf))),
         "page_type": page_type or "other",
-        "evidence_snippets": merged_ev,
+        "evidence_snippets": merged_ev[:6],
         "tone": tone,
         "asks_for": asks_for,
         "risk_reasons": merged_rr,
@@ -521,16 +603,34 @@ def aggregate_llm_results(results: List[dict]) -> Optional[dict]:
     return agg
 
 def analyze_with_llm(page_text: str) -> Optional[dict]:
+    """
+    3-Chunks:
+    - Kontext wird einmal extrahiert und vor jeden Chunk gesetzt.
+    - Gechunked wird nur der MAIN TEXT.
+    """
     if not client or not OPENAI_API_KEY:
         return None
 
-    chunks = chunk_text(page_text, chunk_size=4000, overlap=250, max_chunks=4)
+    context_raw, main_raw = split_context_and_main(page_text)
+
+    context_prefix = normalize_text(context_raw)
+    main_text = main_raw or ""
+    if not normalize_text(main_text):
+        return None
+
+    # Wir wollen pro Modell-Request ungefähr <= 4000 Zeichen Chunk-Text (+ Kontext).
+    # Kontext kann variieren; daher dynamisch: chunk_size = 3600 - len(context_prefix) (min 1600).
+    # (3600 ist konservativ, um JSON/Prompt-Overhead nicht zu sprengen.)
+    ctx_len = len(context_prefix)
+    chunk_size = max(1600, 3600 - ctx_len)
+
+    chunks = chunk_text(main_text, chunk_size=chunk_size, overlap=500, max_chunks=3)
     if not chunks:
         return None
 
-    results = []
+    results: List[dict] = []
     for ch in chunks:
-        r = analyze_with_llm_chunk(ch)
+        r = analyze_with_llm_chunk(context_prefix=context_prefix, chunk=ch)
         if r:
             results.append(r)
 
@@ -630,16 +730,16 @@ def analyze_page(data: PageData) -> RiskResult:
         elif llm_label == "suspicious":
             llm_extra_score += int(20 + 30 * llm_confidence)
 
-        reasons.append(f"LLM-Einschätzung (Chunking): {llm_label.upper()} (Confidence {llm_confidence:.2f}).")
+        reasons.append(f"LLM-Einschätzung (3-Chunks): {llm_label.upper()} (Confidence {llm_confidence:.2f}).")
 
-        # Evidence zuerst (optional, aber sehr hilfreich fürs Debuggen)
+        # Evidence (hilft beim Debuggen und macht Frames nachvollziehbar)
         for ev in (llm_result.get("evidence_snippets") or [])[:6]:
             sn = (ev.get("snippet") or "").strip()
             why = (ev.get("why") or "").strip()
             if sn and why:
                 reasons.append(f"Evidence: „{sn}“ → {why}")
 
-        for rr in (llm_result.get("risk_reasons") or []):
+        for rr in (llm_result.get("risk_reasons") or [])[:8]:
             factor = rr.get("factor", "other")
             conf = rr.get("confidence", 0)
             expl = (rr.get("explanation", "") or "").strip()
@@ -648,7 +748,7 @@ def analyze_page(data: PageData) -> RiskResult:
 
         raw_frames = llm_result.get("frames") or []
         f_list: List[FrameInfo] = []
-        for fr in raw_frames[:10]:
+        for fr in raw_frames[:8]:
             trigger = (fr.get("trigger") or "").strip()
             frame_label = (fr.get("frame_label") or "").strip()
             explanation = (fr.get("explanation") or "").strip()
@@ -695,6 +795,9 @@ def root():
 
 @app.get("/cached", response_model=RiskResult)
 def cached(url: str):
+    """
+    Nur bestätigter, widerspruchsfreier Cache -> sonst 404.
+    """
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
         raise HTTPException(status_code=404, detail="Caching not configured")
 
@@ -708,6 +811,11 @@ def cached(url: str):
 
 @app.post("/analyze", response_model=RiskResult)
 def analyze(page: PageData):
+    """
+    Cache-Flow:
+    - Wenn confirmed + widerspruchsfrei => cached Result (fromCache=True)
+    - sonst => neue Analyse + Summary upsert
+    """
     url_key = url_to_key(page.url)
 
     if AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
@@ -724,6 +832,10 @@ def analyze(page: PageData):
 
 @app.post("/feedback")
 def receive_feedback(fb: Feedback):
+    """
+    1) Feedback-History-Row speichern
+    2) Summary-Row updaten (Confirmed/Counts)
+    """
     if not AIRTABLE_TOKEN:
         raise RuntimeError("AIRTABLE_TOKEN ist nicht gesetzt")
 
