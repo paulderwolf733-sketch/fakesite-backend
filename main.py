@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from urllib.parse import urlparse, quote
+from fastapi import HTTPException
 
 import os
 import requests
@@ -449,6 +450,14 @@ def analyze_page(data: PageData) -> RiskResult:
         content_score += 10
         reasons.append("Viele ungewöhnlich lange Wörter – mögliche Übersetzungs-/Qualitätsprobleme.")
 
+    if should_skip_llm_using_summary(summary):
+    res = result_from_summary(summary)
+    data = res.model_dump()
+    data["status"] = "done"
+    data["fromCache"] = True
+    data["url"] = page.url
+    return data
+    
     if data.hasPassword:
         form_score += 10
         reasons.append("Seite fragt nach einem Passwort.")
@@ -529,9 +538,26 @@ def analyze_page(data: PageData) -> RiskResult:
 # API-Endpunkte
 # ------------------------------------------------------------------------------
 
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "FakeSite Detector Backend läuft.", "docs": "/docs"}
+@app.get("/cached", response_model=RiskResult)
+def cached(url: str):
+    """
+    Gibt NUR dann ein Ergebnis zurück, wenn eine bestätigte, widerspruchsfreie Summary existiert.
+    Sonst 404.
+    """
+    url_key = url_to_key(url)
+    summary = airtable_find_summary_record(url_key)
+
+    if not summary or not should_skip_llm_using_summary(summary):
+        raise HTTPException(status_code=404, detail="No confirmed cached result")
+
+    res = result_from_summary(summary)
+    # Zusatzflag für Extension (wird im JSON mitgegeben)
+    data = res.model_dump()
+    data["status"] = "done"
+    data["fromCache"] = True
+    data["url"] = url
+    return data
+
 
 @app.post("/analyze", response_model=RiskResult)
 def analyze(page: PageData):
@@ -607,3 +633,4 @@ def receive_feedback(fb: Feedback):
         print("Summary feedback update error:", repr(e))
 
     return {"status": "ok"}
+
