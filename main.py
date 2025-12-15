@@ -18,8 +18,8 @@ from openai import OpenAI
 
 app = FastAPI(
     title="FakeSite Detector Backend",
-    version="0.5",
-    description="Heuristik + optional LLM (3-Chunks + Kontext pro Chunk) + separate Textanalyse."
+    version="0.6",
+    description="Heuristik + optional LLM (3-Chunks + Kontext pro Chunk) + Textanalyse mit Fokus auf Framing/Sprachbilder."
 )
 
 app.add_middleware(
@@ -86,35 +86,50 @@ Limits:
 - frames max 8
 """
 
+# ✅ UPDATED: Textanalyse-Fokus auf Framing/Sprachbilder/Intent
 TEXT_SYSTEM_PROMPT = """
 Du analysierst einen vom Nutzer gelieferten Text (Selection oder eingefügt).
+Fokus: FRAMING und rhetorische Wirkung.
+
 Ziele:
-- Worum geht es? (summary)
-- Ton (urgency/threat/greed_appeal)
-- Risiko (safe/suspicious/scam) bezogen auf Manipulation/Betrug/Phishing/Scam-Claims
-- Frames/Trigger (für Highlighting/Erklärung)
+1) Beschreibe kurz, worum es im Text geht (1–3 Sätze).
+2) Identifiziere zentrale FRAMES (Deutungsrahmen) und rhetorische Muster.
+3) Erkläre für jedes Frame: welches Sprachbild / welche mentale Szene erzeugt wird und welche Wirkung beabsichtigt ist.
+4) Ton (urgency/threat/greed_appeal) als Zahlen 0..1.
+5) Optional: Risiko-Label safe/suspicious/scam nur, wenn der Text wirklich in Richtung Betrug/Phishing/Manipulation geht.
+   Wenn es „nur“ Meinung/Politik/Journalismus/Rhetorik ist: overall_label eher "safe" oder "suspicious" (bei starker manipulativer Rhetorik),
+   aber NICHT "scam", außer es geht wirklich um Scam/Phishing/Geld/Accounts.
 
 Sehr wichtig:
-- Erfinde nichts, belege alles mit kurzen evidence_snippets aus dem Text.
-- frames[].trigger MUSS ein exakter Substring aus dem Text sein (copy/paste), max 8 Wörter.
-- Gib NUR JSON aus.
+- Erfinde nichts. Belege alles mit kurzen evidence_snippets aus dem Text.
+- frames[].trigger MUSS ein exakter Substring aus dem Text sein (copy/paste), max. 8 Wörter.
+- Jeder trigger muss in mindestens einem evidence_snippets[].snippet vorkommen.
+- frames[].explanation MUSS enthalten:
+  (a) das Sprachbild / die mentale Szene ("Image"), und
+  (b) die intendierte Wirkung ("Intent"), z.B. Angst erzeugen, Vertrauen aufbauen, Gegner delegitimieren, Dringlichkeit, moralische Empörung.
+
+Gib NUR JSON aus.
 
 Schema:
 {
   "overall_label": "safe" | "suspicious" | "scam",
   "overall_confidence": float,
-  "summary": string,
+  "summary": string,   // hier: kurze Inhalts- UND Framing-Zusammenfassung
   "tone": { "urgency": float, "threat": float, "greed_appeal": float },
   "asks_for": { "money": bool, "credentials": bool, "personal_data": bool, "crypto_transfer": bool },
   "evidence_snippets": [ { "snippet": string, "why": string } ],
-  "risk_reasons": [ { "factor": string, "confidence": float, "explanation": string } ],
-  "frames": [ { "trigger": string, "frame_label": string, "explanation": string } ]
+  "risk_reasons": [
+    { "factor": string, "confidence": float, "explanation": string }
+  ],
+  "frames": [
+    { "trigger": string, "frame_label": string, "explanation": string }
+  ]
 }
 
 Limits:
 - evidence_snippets max 6
 - risk_reasons max 8
-- frames max 8
+- frames max 10
 """
 
 # ------------------------------------------------------------------------------
@@ -207,7 +222,6 @@ class RiskResult(BaseModel):
     level: Literal["green", "yellow", "red"]
     reasons: List[str]
 
-    # page description
     purpose: Optional[str] = None
     summary: Optional[str] = None
     tone: Optional[ToneInfo] = None
@@ -232,9 +246,11 @@ class TextAnalyzeRequest(BaseModel):
 class TextAnalyzeResult(BaseModel):
     status: Literal["none", "pending", "done", "error"] = "done"
     mode: Literal["selection", "custom"] = "custom"
+
     overall_label: Literal["safe", "suspicious", "scam"] = "safe"
     overall_confidence: float = 0.0
     score: int = 0
+
     summary: str = ""
     tone: ToneInfo = ToneInfo()
     reasons: List[str] = []
@@ -395,7 +411,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int = 500, max_chunks: int =
     t = normalize_text(text)
     if not t:
         return []
-    chunks = []
+    chunks: List[str] = []
     start = 0
     n = len(t)
     while start < n and len(chunks) < max_chunks:
@@ -423,7 +439,7 @@ def _trigger_word_count_ok(trigger: str, max_words: int = 8) -> bool:
 
 def _enforce_trigger_in_evidence(frames: List[dict], evidence: List[dict]) -> List[dict]:
     ev_text = " ".join([(e.get("snippet") or "") for e in (evidence or [])]).lower()
-    out = []
+    out: List[dict] = []
     for fr in frames or []:
         if not isinstance(fr, dict):
             continue
@@ -437,7 +453,7 @@ def _enforce_trigger_in_evidence(frames: List[dict], evidence: List[dict]) -> Li
         out.append(fr)
     return out
 
-def _json_from_completion(raw: str) -> Optional[dict]:
+def _json_from_completion(raw: str) -> dict:
     start = raw.find("{")
     end = raw.rfind("}")
     raw_json = raw[start:end+1] if start != -1 and end != -1 else raw
@@ -458,11 +474,12 @@ def llm_call(system_prompt: str, user_text: str) -> Optional[dict]:
         raw = completion.choices[0].message.content or ""
         parsed = _json_from_completion(raw)
 
-        # hardening
+        # Hardening: Frames nur, wenn Trigger in Evidence + kurz genug
         ev = parsed.get("evidence_snippets") or []
         fr = parsed.get("frames") or []
         if isinstance(fr, list) and isinstance(ev, list):
-            parsed["frames"] = _enforce_trigger_in_evidence(fr, ev)[:8]
+            # ✅ allow up to 10 generally (page prompt will still restrict)
+            parsed["frames"] = _enforce_trigger_in_evidence(fr, ev)[:10]
 
         parsed["overall_confidence"] = float(max(0.0, min(1.0, _safe_float(parsed.get("overall_confidence", 0.0)))))
         return parsed
@@ -495,7 +512,7 @@ def aggregate_chunk_results(items: List[dict]) -> Optional[dict]:
         if counts:
             page_type = sorted(counts.items(), key=lambda x: x[1], reverse=True)[0][0]
 
-    # purpose/summary: take from worst if present else longest
+    # purpose/summary: prefer worst, else longest non-empty
     purpose = (worst_r.get("purpose") or "").strip()
     summary = (worst_r.get("summary") or "").strip()
     if not purpose:
@@ -523,9 +540,10 @@ def aggregate_chunk_results(items: List[dict]) -> Optional[dict]:
             asks_for[k] = asks_for[k] or bool(a.get(k, False))
 
     # evidence merge (worst first)
-    merged_ev = []
+    merged_ev: List[dict] = []
     seen_ev = set()
-    def add_ev(r):
+
+    def add_ev(r: dict):
         nonlocal merged_ev, seen_ev
         for ev in (r.get("evidence_snippets") or [])[:6]:
             if not isinstance(ev, dict):
@@ -541,6 +559,7 @@ def aggregate_chunk_results(items: List[dict]) -> Optional[dict]:
             merged_ev.append({"snippet": sn, "why": why})
             if len(merged_ev) >= 8:
                 return
+
     add_ev(worst_r)
     for r in items:
         if r is worst_r:
@@ -550,7 +569,7 @@ def aggregate_chunk_results(items: List[dict]) -> Optional[dict]:
             break
 
     # risk_reasons merge
-    merged_rr = []
+    merged_rr: List[dict] = []
     seen_rr = set()
     for r in items:
         for rr in (r.get("risk_reasons") or [])[:8]:
@@ -566,11 +585,12 @@ def aggregate_chunk_results(items: List[dict]) -> Optional[dict]:
                 continue
             seen_rr.add(key)
             merged_rr.append({"factor": factor, "confidence": conf, "explanation": expl})
+
     merged_rr.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
     merged_rr = merged_rr[:8]
 
     # frames merge and enforce in evidence
-    merged_frames = []
+    merged_frames: List[dict] = []
     seen_fr = set()
     for r in items:
         for fr in (r.get("frames") or [])[:8]:
@@ -588,6 +608,7 @@ def aggregate_chunk_results(items: List[dict]) -> Optional[dict]:
                 continue
             seen_fr.add(key)
             merged_frames.append({"trigger": trig, "frame_label": fl, "explanation": ex})
+
     merged_frames = _enforce_trigger_in_evidence(merged_frames, merged_ev)[:8]
 
     return {
@@ -613,7 +634,6 @@ def analyze_page_with_llm(page_text: str) -> Optional[dict]:
     if not normalize_text(main_text):
         return None
 
-    # Chunk size so that context+chunk fits comfortably (conservative)
     ctx_len = len(context_prefix)
     chunk_size = max(1600, 3600 - ctx_len)
 
@@ -621,7 +641,7 @@ def analyze_page_with_llm(page_text: str) -> Optional[dict]:
     if not chunks:
         return None
 
-    results = []
+    results: List[dict] = []
     for ch in chunks:
         user_text = (
             "KONTEXT:\n" + context_prefix + "\n\n"
@@ -638,8 +658,7 @@ def analyze_text_with_llm(text: str) -> Optional[dict]:
     if not t:
         return None
     user_text = "TEXT:\n" + t
-    r = llm_call(TEXT_SYSTEM_PROMPT, user_text)
-    return r
+    return llm_call(TEXT_SYSTEM_PROMPT, user_text)
 
 # ------------------------------------------------------------------------------
 # Heuristics
@@ -758,7 +777,6 @@ def analyze_page(data: PageData) -> RiskResult:
 
         reasons.append(f"LLM: {llm_label.upper()} (Confidence {llm_conf:.2f}).")
 
-        # include a few evidence snippets for transparency
         for ev in (llm.get("evidence_snippets") or [])[:4]:
             sn = (ev.get("snippet") or "").strip()
             why = (ev.get("why") or "").strip()
@@ -814,17 +832,21 @@ def analyze_page(data: PageData) -> RiskResult:
     )
 
 # ------------------------------------------------------------------------------
-# Text analyze endpoint logic
+# Text analyze endpoint logic (Framing)
 # ------------------------------------------------------------------------------
 
 def score_from_text_label(label: str, conf: float) -> int:
+    """
+    Textanalyse soll Framing/Rhetorik nicht automatisch als 'Scam' überbewerten.
+    """
     label = (label or "safe").lower()
     conf = max(0.0, min(1.0, conf))
+
     if label == "scam":
-        return int(60 + 40 * conf)   # 60..100
+        return int(65 + 35 * conf)      # 65..100
     if label == "suspicious":
-        return int(30 + 40 * conf)   # 30..70
-    return int(5 + 20 * (1.0 - conf))  # 5..25
+        return int(25 + 45 * conf)      # 25..70
+    return int(5 + 15 * (1.0 - conf))   # 5..20
 
 def analyze_text(req: TextAnalyzeRequest) -> TextAnalyzeResult:
     llm = analyze_text_with_llm(req.text)
@@ -841,9 +863,149 @@ def analyze_text(req: TextAnalyzeRequest) -> TextAnalyzeResult:
     conf = float(_safe_float(llm.get("overall_confidence", 0.0)))
 
     score = score_from_text_label(label, conf)
+
     summary = (llm.get("summary") or "").strip()
 
     t = llm.get("tone") or {}
     tone = ToneInfo(
         urgency=float(max(0.0, min(1.0, _safe_float(t.get("urgency", 0.0))))),
-        threat=float(max(0.0, min(1.0, _safe_float(t.get("threat", 0.0))))
+        threat=float(max(0.0, min(1.0, _safe_float(t.get("threat", 0.0))))),
+        greed_appeal=float(max(0.0, min(1.0, _safe_float(t.get("greed_appeal", 0.0)))))
+    )
+
+    reasons: List[str] = []
+    reasons.append(f"Text-LLM: {label.upper()} (Confidence {conf:.2f}).")
+
+    for ev in (llm.get("evidence_snippets") or [])[:6]:
+        sn = (ev.get("snippet") or "").strip()
+        why = (ev.get("why") or "").strip()
+        if sn and why:
+            reasons.append(f"Evidence: „{sn}“ → {why}")
+
+    # risk_reasons hier eher als "Framing-/Rhetorik-Taktiken"
+    for rr in (llm.get("risk_reasons") or [])[:8]:
+        factor = (rr.get("factor") or "framing").strip()
+        rconf = _safe_float(rr.get("confidence", 0.0))
+        expl = (rr.get("explanation", "") or "").strip()
+        if expl:
+            reasons.append(f"Taktik ({factor}, {rconf:.2f}): {expl}")
+
+    frames: List[FrameInfo] = []
+    raw_frames = llm.get("frames") or []
+    for fr in raw_frames[:10]:
+        trig = (fr.get("trigger") or "").strip()
+        fl = (fr.get("frame_label") or "").strip()
+        ex = (fr.get("explanation") or "").strip()
+        if trig and fl and ex:
+            frames.append(FrameInfo(trigger=trig, frame_label=fl, explanation=ex))
+
+    return TextAnalyzeResult(
+        status="done",
+        mode=req.mode,
+        overall_label=label,  # type: ignore
+        overall_confidence=float(max(0.0, min(1.0, conf))),
+        score=int(max(0, min(100, score))),
+        summary=summary,
+        tone=tone,
+        reasons=reasons,
+        frames=frames
+    )
+
+# ------------------------------------------------------------------------------
+# API
+# ------------------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "FakeSite Detector Backend läuft.", "docs": "/docs"}
+
+@app.get("/cached", response_model=RiskResult)
+def cached(url: str):
+    """
+    Nur bestätigter, widerspruchsfreier Cache -> sonst 404.
+    """
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
+        raise HTTPException(status_code=404, detail="Caching not configured")
+
+    url_key = url_to_key(url)
+    summary = airtable_find_summary_record(url_key)
+
+    if not summary or not should_skip_llm_using_summary(summary):
+        raise HTTPException(status_code=404, detail="No confirmed cached result")
+
+    return result_from_summary(summary, page_url=url, cached=True)
+
+@app.post("/analyze", response_model=RiskResult)
+def analyze(page: PageData):
+    """
+    Cache-Flow:
+    - Wenn confirmed + widerspruchsfrei => cached Result
+    - sonst => neue Analyse + Summary upsert
+    """
+    url_key = url_to_key(page.url)
+
+    if AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
+        summary = airtable_find_summary_record(url_key)
+        if should_skip_llm_using_summary(summary):
+            return result_from_summary(summary, page_url=page.url, cached=True)
+
+    result = analyze_page(page)
+
+    if AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME:
+        airtable_upsert_summary(url_key=url_key, page_url=page.url, result=result)
+
+    return result
+
+@app.post("/analyze_text", response_model=TextAnalyzeResult)
+def analyze_text_endpoint(req: TextAnalyzeRequest):
+    """
+    Separate Textanalyse (Selection oder eingefügt) mit Fokus auf Framing/Sprachbilder/Intent.
+    """
+    if not req.text or len(req.text.strip()) < 10:
+        return TextAnalyzeResult(status="error", mode=req.mode, reasons=["Text ist zu kurz."])
+
+    return analyze_text(req)
+
+@app.post("/feedback")
+def receive_feedback(fb: Feedback):
+    """
+    1) Feedback-History-Row speichern
+    2) Summary-Row updaten (Confirmed/Counts)
+    """
+    if not AIRTABLE_TOKEN:
+        raise RuntimeError("AIRTABLE_TOKEN ist nicht gesetzt")
+
+    base_url = get_airtable_base_url()
+    headers = airtable_headers()
+
+    reasons_text = "\n".join(fb.backend_reasons or [])
+    url_key = url_to_key(fb.url)
+
+    payload_feedback = {
+        "records": [
+            {
+                "fields": {
+                    "URL": fb.url,
+                    "Backend Score": fb.backend_score,
+                    "Backend Level": fb.backend_level,
+                    "Backend Reasons": reasons_text,
+                    "User Label": fb.user_label,
+
+                    "Record Type": "feedback",
+                    "URL Key": url_key,
+                    "Last Updated": utc_iso_z(),
+                }
+            }
+        ]
+    }
+
+    resp = requests.post(base_url, headers=headers, json=payload_feedback, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Airtable-Fehler (Feedback row): {resp.status_code} {resp.text}")
+
+    try:
+        airtable_update_summary_feedback(url_key=url_key, user_label=fb.user_label)
+    except Exception as e:
+        print("Summary feedback update error:", repr(e))
+
+    return {"status": "ok"}
