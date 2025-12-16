@@ -260,7 +260,6 @@ def result_from_summary(summary_record: Dict[str, Any], page_url: str, cached: b
     purpose = (f.get("Last Purpose") or "").strip() or None
     summary = (f.get("Last Summary") or "").strip() or None
 
-    # Tone wird aktuell nicht persistiert (kann man optional ergänzen)
     return RiskResult(
         status="done",
         fromCache=cached,
@@ -367,6 +366,9 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     return candidate or None
 
 def _safe_json_loads(text: str) -> Optional[dict]:
+    """
+    Fallback parser: falls response_format nicht greift oder ein Modell doch "kaputt" antwortet.
+    """
     try:
         raw = _extract_first_json_object(text) or text
         return json.loads(raw)
@@ -414,20 +416,24 @@ def _chunk_text(text: str, chunk_size: int, overlap: int = 500, max_chunks: int 
         start = max(0, end - overlap)
     return out
 
+# ✅ UPDATED: JSON-Output erzwingen via response_format, fallback auf safe parser
 def llm_call_json(system_prompt: str, user_text: str) -> Optional[dict]:
     if not client or not OPENAI_API_KEY:
         return None
+
     try:
+        # 1) Primär: erzwinge JSON-Objekt
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
+            response_format={"type": "json_object"},  # ✅ das Update
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
         )
         raw = completion.choices[0].message.content or ""
-        parsed = _safe_json_loads(raw)
+        parsed = _safe_json_loads(raw)  # sollte jetzt praktisch immer klappen
         if not parsed or not isinstance(parsed, dict):
             return None
 
@@ -436,9 +442,32 @@ def llm_call_json(system_prompt: str, user_text: str) -> Optional[dict]:
                 max(0.0, min(1.0, _safe_float(parsed.get("overall_confidence", 0.0))))
             )
         return parsed
+
     except Exception as e:
-        print("LLM call error:", repr(e))
-        return None
+        # 2) Fallback: wenn response_format vom Modell/Endpoint nicht akzeptiert wird
+        #    versuchen wir es ohne response_format und parsen "best effort"
+        try:
+            completion = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+            )
+            raw = completion.choices[0].message.content or ""
+            parsed = _safe_json_loads(raw)
+            if not parsed or not isinstance(parsed, dict):
+                return None
+
+            if "overall_confidence" in parsed:
+                parsed["overall_confidence"] = float(
+                    max(0.0, min(1.0, _safe_float(parsed.get("overall_confidence", 0.0))))
+                )
+            return parsed
+        except Exception as e2:
+            print("LLM call error:", repr(e), " / fallback:", repr(e2))
+            return None
 
 # ------------------------------------------------------------------------------
 # Website LLM analysis (3 chunks) + aggregation
@@ -455,9 +484,8 @@ def analyze_page_with_llm_3chunks(page_text: str) -> Optional[dict]:
     if not main:
         return None
 
-    # dynamische Chunkgröße: Kontext nimmt Platz weg
     ctx_len = len(context)
-    chunk_size = max(1800, 4200 - ctx_len)  # ungefähr 3 Chunks im Rahmen
+    chunk_size = max(1800, 4200 - ctx_len)
 
     chunks = _chunk_text(main, chunk_size=chunk_size, overlap=500, max_chunks=3)
     if not chunks:
@@ -473,7 +501,6 @@ def analyze_page_with_llm_3chunks(page_text: str) -> Optional[dict]:
     if not results:
         return None
 
-    # worst label wins; tie -> higher confidence
     best = None
     for r in results:
         lab = str(r.get("overall_label", "safe")).lower()
@@ -565,7 +592,6 @@ def analyze_text_with_llm(text: str) -> Optional[dict]:
     if not r:
         return None
 
-    # harden frames: trigger must be substring + structure
     frames_out = []
     for fr in (r.get("frames") or [])[:10]:
         if not isinstance(fr, dict):
